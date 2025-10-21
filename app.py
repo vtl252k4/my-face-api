@@ -15,9 +15,9 @@ app = Flask(__name__)
 # === 1. CẤU HÌNH CLOUDINARY ===
 # (Chúng ta sẽ KHÔNG hardcode Key ở đây, mà dùng Environment Variables)
 cloudinary.config(
-    cloud_name = os.environ.get('ddjx4cvgr'),
-    api_key = os.environ.get('972296858383671'),
-    api_secret = os.environ.get('BhrgCrWWrQfSXOtMg5xv0YH0nZM')
+    cloud_name = os.environ.get('CLOUDINARY_CLOUD_NAME'),
+    api_key = os.environ.get('CLOUDINARY_API_KEY'),
+    api_secret = os.environ.get('CLOUDINARY_API_SECRET')
 )
 print("Cloudinary Configured.")
 
