@@ -1,54 +1,86 @@
 from flask import Flask, request, jsonify
-import face_recognition
+import cv2
 import numpy as np
 import base64
 import io
 from PIL import Image
+import os
 
 app = Flask(__name__)
 
-# "Cơ sở dữ liệu" tạm thời để lưu khuôn mặt (sẽ mất khi server restart)
-# Trong thực tế nên dùng database, nhưng với free tier của Render, 
-# server sẽ restart và mất dữ liệu. Đây là nhược điểm của gói miễn phí.
-known_face_encodings = []
-known_face_uids = []
+# OpenCV dùng file .yml để lưu "Cơ sở dữ liệu" khuôn mặt
+# Render là hệ thống file "chỉ đọc", ta phải lưu vào thư mục /tmp
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+FACE_DB_PATH = "/tmp/face_data.yml"
 
-@app.route('/')
-def home():
-    return "Face Recognition API is running."
+# Ánh xạ UID (string) sang ID (số nguyên) vì OpenCV chỉ nhận số
+uid_to_id_map = {}
+id_to_uid_map = {}
+next_id = 1
+
+# Hàm tải CSDL (nếu có) khi server khởi động
+def load_database():
+    global uid_to_id_map, id_to_uid_map, next_id
+    if os.path.exists(FACE_DB_PATH):
+        try:
+            recognizer.read(FACE_DB_PATH)
+            # (Với Render free tier, CSDL này sẽ mất khi server restart/ngủ)
+            print("Database loaded from previous session (if any)")
+        except Exception as e:
+            print(f"Could not read DB: {e}")
+
+load_database()
+
+# Hàm trợ giúp: chuyển ảnh base64 sang ảnh OpenCV (ảnh xám)
+def b64_to_cv_image(b64_string):
+    if ',' in b64_string:
+        b64_string = b64_string.split(',')[1]
+
+    image_data = base64.b64decode(b64_string)
+    image = Image.open(io.BytesIO(image_data))
+    image_np = np.array(image)
+    # Chuyển sang ảnh xám
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    return gray
 
 # API 1: Thêm/Enroll Giảng viên
 @app.route('/enroll', methods=['POST'])
 def enroll_face():
+    global next_id
     data = request.json
     if 'uid' not in data or 'image_base64' not in data:
         return jsonify({"status": "error", "message": "Missing uid or image"}), 400
 
     try:
-        image_data = base64.b64decode(data['image_base64'])
-        image = Image.open(io.BytesIO(image_data))
-        image_np = np.array(image)
+        target_uid = data['uid']
+        gray_image = b64_to_cv_image(data['image_base64'])
 
-        face_encodings = face_recognition.face_encodings(image_np)
-        if not face_encodings:
+        # Tìm khuôn mặt
+        faces = detector.detectMultiScale(gray_image, 1.3, 5)
+        if len(faces) == 0:
             return jsonify({"status": "error", "message": "No face found"}), 400
 
-        face_encoding = face_encodings[0]
+        (x, y, w, h) = faces[0] # Lấy mặt đầu tiên
+        face_roi = gray_image[y:y+h, x:x+w]
 
-        # Kiểm tra xem UID đã tồn tại chưa
-        if data['uid'] in known_face_uids:
-            # Nếu đã tồn tại, cập nhật encoding
-            idx = known_face_uids.index(data['uid'])
-            known_face_encodings[idx] = face_encoding
-            message = "Face updated"
+        # Gán ID (số) cho UID (chữ)
+        if target_uid not in uid_to_id_map:
+            uid_to_id_map[target_uid] = next_id
+            id_to_uid_map[next_id] = target_uid
+            current_id = next_id
+            next_id += 1
         else:
-            # Nếu chưa, thêm mới
-            known_face_encodings.append(face_encoding)
-            known_face_uids.append(data['uid'])
-            message = "Face enrolled"
+            current_id = uid_to_id_map[target_uid]
 
-        print(f"Enrolled/Updated face with UID: {data['uid']}")
-        return jsonify({"status": "success", "message": message}), 201
+        # "Train" (cập nhật mô hình)
+        recognizer.update([face_roi], np.array([current_id]))
+
+        # Lưu CSDL vào file tạm
+        recognizer.write(FACE_DB_PATH)
+
+        print(f"Enrolled/Updated face for UID: {target_uid} (mapped to ID: {current_id})")
+        return jsonify({"status": "success", "message": "Face enrolled/updated"}), 201
 
     except Exception as e:
         print(f"Enroll error: {e}")
@@ -64,32 +96,35 @@ def verify_face():
     try:
         target_uid = data['uid']
 
-        # 1. Tìm encoding đã lưu của UID này
-        known_encoding = None
-        try:
-            target_index = known_face_uids.index(target_uid)
-            known_encoding = known_face_encodings[target_index]
-        except ValueError:
-            return jsonify({"status": "error", "match": False, "message": "UID not enrolled"}), 404
+        # 1. Kiểm tra UID có trong CSDL không
+        if target_uid not in uid_to_id_map:
+             return jsonify({"status": "error", "match": False, "message": "UID not enrolled"}), 404
 
-        # 2. Giải mã ảnh mới
-        image_data = base64.b64decode(data['image_base64'])
-        image = Image.open(io.BytesIO(image_data))
-        unknown_image_np = np.array(image)
+        target_id = uid_to_id_map[target_uid]
+        gray_image = b64_to_cv_image(data['image_base64'])
 
-        unknown_encodings = face_recognition.face_encodings(unknown_image_np)
-        if not unknown_encodings:
+        # 2. Tìm mặt
+        faces = detector.detectMultiScale(gray_image, 1.3, 5)
+        if len(faces) == 0:
             return jsonify({"status": "error", "match": False, "message": "No face found in image"}), 400
 
-        unknown_encoding = unknown_encodings[0] 
+        (x, y, w, h) = faces[0]
+        face_roi = gray_image[y:y+h, x:x+w]
 
-        # 3. So sánh 1-với-1
-        is_match = face_recognition.compare_faces([known_encoding], unknown_encoding, tolerance=0.5)[0]
+        # 3. Nhận diện
+        # recognizer.predict trả về (id, confidence)
+        # Confidence (độ tin cậy) của OpenCV càng THẤP thì càng GIỐNG
+        id_predicted, confidence = recognizer.predict(face_roi)
 
-        if is_match:
-            return jsonify({"status": "success", "match": True})
+        print(f"Verify request for UID: {target_uid} (ID: {target_id}).")
+        print(f"OpenCV predicted ID: {id_predicted} with confidence: {confidence}")
+
+        # 4. So sánh
+        # Đặt ngưỡng tin cậy (ví dụ: dưới 70 là khớp)
+        if id_predicted == target_id and confidence < 70:
+            return jsonify({"status": "success", "match": True, "confidence": confidence})
         else:
-            return jsonify({"status": "error", "match": False, "message": "Face does not match UID"})
+            return jsonify({"status": "error", "match": False, "message": "Face does not match UID", "confidence": confidence})
 
     except Exception as e:
         print(f"Verify error: {e}")
