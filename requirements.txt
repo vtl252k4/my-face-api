@@ -2,4 +2,4 @@ flask
 gunicorn
 numpy
 Pillow
-face_recognition
+opencv-python-headless
